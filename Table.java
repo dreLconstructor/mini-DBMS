@@ -7,23 +7,84 @@ class Table implements Serializable {
     private List<Attribute> attributes;
     private String primaryKey;
     private transient RandomAccessFile dataFile;
-    private BSTIndex index;
+    private transient BSTIndex index;
+    private String tablePath;
     private String dataFileName;
     private String indexFileName;
     private int recordCount;
+    private transient Database database;
 
-    public Table(String name, List<String> attrTokens) throws Exception {
+    // Constructor for new table
+    public Table(Database database, String name, List<String> attrTokens) throws Exception {
+        this.database = database;
         this.name = name.toLowerCase();
         this.attributes = new ArrayList<>();
         this.recordCount = 0;
         parseAttributes(attrTokens);
 
+        // Create table directory
+        this.tablePath = database.getPath() + File.separator + Database.TABLES_DIR + File.separator + this.name;
+        File tableDir = new File(tablePath);
+        if (!tableDir.exists() && !tableDir.mkdirs()) {
+            throw new Exception("Failed to create table directory");
+        }
+
         // Create file names
-        this.dataFileName = name + ".dat";
-        this.indexFileName = name + ".idx";
+        this.dataFileName = tablePath + File.separator + "data.dat";
+        this.indexFileName = tablePath + File.separator + "index.idx";
 
         // Initialize files
         initFiles();
+    }
+
+    // Constructor for loading existing table
+    private Table() {
+    }
+
+    // Load table from disk
+    public static Table load(Database database, String tableName, TableMetadata metadata) throws Exception {
+        Table table = new Table();
+        table.database = database;
+        table.name = tableName.toLowerCase();
+        table.recordCount = metadata.getRecordCount();
+        table.primaryKey = metadata.getPrimaryKey();
+        
+        // Reconstruct attributes from metadata
+        table.attributes = new ArrayList<>();
+        List<String> attrNames = metadata.getAttributeNames();
+        List<DataType> attrTypes = metadata.getAttributeTypes();
+        List<Boolean> isPK = metadata.getIsPrimaryKey();
+        
+        for (int i = 0; i < attrNames.size(); i++) {
+            Attribute attr = new Attribute(attrNames.get(i), attrTypes.get(i), isPK.get(i));
+            table.attributes.add(attr);
+        }
+        
+        // Set table path
+        table.tablePath = database.getPath() + File.separator + Database.TABLES_DIR + File.separator + table.name;
+        table.dataFileName = table.tablePath + File.separator + "data.dat";
+        table.indexFileName = table.tablePath + File.separator + "index.idx";
+        
+        // Initialize files
+        File dataFileObj = new File(table.dataFileName);
+        if (!dataFileObj.exists()) {
+            return null;
+        }
+        
+        table.dataFile = new RandomAccessFile(table.dataFileName, "rw");
+        table.index = new BSTIndex(table.name, table.primaryKey);
+        
+        // Load index if exists
+        File idxFile = new File(table.indexFileName);
+        if (idxFile.exists()) {
+            try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(idxFile))) {
+                table.index = (BSTIndex) ois.readObject();
+            }
+        } else if (table.primaryKey != null) {
+            table.rebuildIndexFromData();
+        }
+        
+        return table;
     }
 
     public Record getRecordAtPosition(long position) throws Exception {
@@ -39,6 +100,9 @@ class Table implements Serializable {
             writeHeader();
         }
 
+        // Initialize index
+        index = new BSTIndex(name, primaryKey);
+        
         // Load or create index
         loadIndex();
     }
@@ -68,8 +132,8 @@ class Table implements Serializable {
         } else {
             // Create new index if table has primary key
             if (primaryKey != null) {
-                index = new BSTIndex(name, primaryKey);
                 rebuildIndexFromData();
+                saveIndex();
             }
         }
     }
@@ -77,16 +141,21 @@ class Table implements Serializable {
     private void rebuildIndexFromData() throws Exception {
         if (primaryKey == null) return;
 
+        index = new BSTIndex(name, primaryKey);
         long currentPos = getFirstRecordPosition();
 
         while (currentPos < dataFile.length()) {
             dataFile.seek(currentPos);
             try {
-                Record record = readRecordAtCurrentPosition();
-                if (record != null) {
-                    Object keyValue = record.getValue(primaryKey);
-                    if (keyValue instanceof Comparable) {
-                        index.insert((Comparable) keyValue, currentPos);
+                byte marker = dataFile.readByte();
+                if (marker == 0x01) { // Active record
+                    // Read the record to get key value
+                    Record record = readRecordAtCurrentPosition();
+                    if (record != null) {
+                        Object keyValue = record.getValue(primaryKey);
+                        if (keyValue instanceof Comparable) {
+                            index.insert((Comparable) keyValue, currentPos);
+                        }
                     }
                 }
                 currentPos = dataFile.getFilePointer();
@@ -201,13 +270,6 @@ class Table implements Serializable {
         return true;
     }
 
-    // [CHANGED] silent flag suppresses the "1 record inserted" message during internal ops (e.g. LET)
-    private boolean silentInsert = false;
-
-    public void setSilentInsert(boolean silent) {
-        this.silentInsert = silent;
-    }
-
     public void insert(List<String> valueTokens) throws Exception {
         if (valueTokens.size() != attributes.size()) {
             throw new Exception("Expected " + attributes.size() + " values, got " + valueTokens.size());
@@ -251,8 +313,7 @@ class Table implements Serializable {
 
         recordCount++;
         updateRecordCount();
-        // [CHANGED] suppress print when called internally (e.g. during LET/createTableFromSelect)
-        if (!silentInsert) System.out.println("1 record inserted");
+        System.out.println("1 record inserted");
     }
 
     private long writeRecord(Record record) throws Exception {
@@ -613,15 +674,12 @@ class Table implements Serializable {
 
     private void compactFile() throws Exception {
         // Create a temporary file
-        String tempFileName = name + "_temp.dat";
+        String tempFileName = tablePath + File.separator + "temp.dat";
         RandomAccessFile tempFile = new RandomAccessFile(tempFileName, "rw");
 
         // Copy header to temp file
-        // [CHANGED] getFirstRecordPosition() moves the file pointer to after the header,
-        // so we must seek(0) again before readFully to read from the beginning of the file.
-        long headerSize = getFirstRecordPosition();
         dataFile.seek(0);
-        byte[] header = new byte[(int) headerSize];
+        byte[] header = new byte[(int) getFirstRecordPosition()];
         dataFile.readFully(header);
         tempFile.write(header);
 
@@ -798,22 +856,8 @@ class Table implements Serializable {
             throw new Exception("Duplicate attribute names in RENAME list");
         }
 
-        // [CHANGED] Read all existing records BEFORE changing attribute names,
-        // so we can remap values by position when rewriting the file.
-        List<Record> existingRecords = new ArrayList<>();
-        List<Long> positions = getAllRecordPositions();
-        for (Long pos : positions) {
-            Record r = readRecordAtPosition(pos);
-            if (r != null) existingRecords.add(r);
-        }
-
-        // Capture old attribute names (for value remapping below)
-        List<String> oldAttrNames = new ArrayList<>();
-        for (Attribute attr : attributes) {
-            oldAttrNames.add(attr.getName());
-        }
-
-        // Build new attribute list
+        // Update attribute names
+        String oldPrimaryKey = primaryKey;
         primaryKey = null;
 
         List<Attribute> newAttributes = new ArrayList<>();
@@ -830,34 +874,32 @@ class Table implements Serializable {
             }
         }
 
-        // [CHANGED] Switch to new attributes before rewriting so writeHeader() uses new names.
+        // Update the table header in the data file
+        long currentPos = dataFile.getFilePointer();
+        dataFile.seek(0);
+        dataFile.writeInt(newAttributes.size());
+
+        for (Attribute attr : newAttributes) {
+            dataFile.writeUTF(attr.getName());
+            dataFile.writeInt(attr.getType().ordinal());
+            dataFile.writeBoolean(attr.isPrimaryKey());
+        }
+
+        // Preserve record count
+        dataFile.writeInt(recordCount);
+
+        // Update attributes list
         attributes = newAttributes;
 
-        // [CHANGED] Rewrite the entire file instead of overwriting just the header in place.
-        // Overwriting only the header leaves stale bytes when UTF-8 name lengths differ,
-        // which corrupts the record data that follows.
-        dataFile.setLength(0);
-        dataFile.seek(0);
-        recordCount = 0;
-        writeHeader(); // writes new header (attribute count, new names, types, PK flags, count=0)
-
-        // Re-write every record, remapping values from old names to new names by position
-        for (Record oldRecord : existingRecords) {
-            Record newRecord = new Record();
-            for (int i = 0; i < oldAttrNames.size(); i++) {
-                newRecord.setValue(newAttributes.get(i).getName(), oldRecord.getValue(oldAttrNames.get(i)));
-            }
-            writeRecord(newRecord);
-            recordCount++;
-        }
-        updateRecordCount();
-
-        // Rebuild index whenever primary key is involved (name may have changed)
-        if (primaryKey != null && index != null) {
+        // Update index if primary key changed
+        if (primaryKey != null && !primaryKey.equals(oldPrimaryKey) && index != null) {
             index = new BSTIndex(name, primaryKey);
             rebuildIndexFromData();
             saveIndex();
         }
+
+        // Return to previous position
+        dataFile.seek(currentPos);
     }
 
     public void selectAggregate(String function, String attribute, Condition whereCondition) throws Exception {
@@ -895,8 +937,6 @@ class Table implements Serializable {
                     System.out.println("-".repeat(50));
                     System.out.println("1. " + records.size());
                 } else {
-                    // [CHANGED] validate attribute exists
-                    if (getAttribute(attribute) == null) throw new Exception("Unknown attribute: " + attribute);
                     int count = 0;
                     for (Record record : records) {
                         Object val = record.getValue(attribute);
@@ -911,8 +951,6 @@ class Table implements Serializable {
                 break;
 
             case "MIN":
-                // [CHANGED] validate attribute exists before scanning
-                if (getAttribute(attribute) == null) throw new Exception("Unknown attribute: " + attribute);
                 Object min = null;
                 for (Record record : records) {
                     Object val = record.getValue(attribute);
@@ -927,13 +965,11 @@ class Table implements Serializable {
                 if (min instanceof String) {
                     System.out.println("1. \"" + min + "\"");
                 } else {
-                    System.out.println("1. " + (min == null ? "Nothing found" : min));
+                    System.out.println("1. " + min);
                 }
                 break;
 
             case "MAX":
-                // [CHANGED] validate attribute exists before scanning
-                if (getAttribute(attribute) == null) throw new Exception("Unknown attribute: " + attribute);
                 Object max = null;
                 for (Record record : records) {
                     Object val = record.getValue(attribute);
@@ -948,11 +984,10 @@ class Table implements Serializable {
                 if (max instanceof String) {
                     System.out.println("1. \"" + max + "\"");
                 } else {
-                    System.out.println("1. " + (max == null ? "Nothing found" : max));
+                    System.out.println("1. " + max);
                 }
                 break;
 
-            case "AVERAGE": // [CHANGED] alias for AVG — rubric uses "AVERAGE" interchangeably
             case "AVG":
                 if (attribute.equalsIgnoreCase("*")) {
                     throw new Exception("AVG cannot be used with *");
@@ -1015,6 +1050,10 @@ class Table implements Serializable {
         return index;
     }
 
+    public TableMetadata getMetadata() {
+        return new TableMetadata(name, attributes, primaryKey, recordCount);
+    }
+
     public void describe() {
         System.out.println(name.toUpperCase());
         for (Attribute attr : attributes) {
@@ -1028,16 +1067,6 @@ class Table implements Serializable {
 
     public String getName() {
         return name;
-    }
-
-    // [CHANGED] Returns record positions in BST in-order if the table has a primary key,
-    // or in file order otherwise. All cross-joins and LET must use this so that every
-    // student gets the same result ordering (per the rubric requirement).
-    public List<Long> getOrderedRecordPositions() throws Exception {
-        if (primaryKey != null && index != null) {
-            return index.inOrderTraversal();
-        }
-        return getAllRecordPositions();
     }
 
     public List<Attribute> getAttributes() {
@@ -1065,12 +1094,7 @@ class Table implements Serializable {
         saveIndex();
     }
 
-    // [CHANGED] Reopen the transient RandomAccessFile after Java deserialization.
-    // When Database.load() deserializes the Database object, each Table's dataFile
-    // field is null (transient). This method restores it so the table is usable.
-    private void readObject(java.io.ObjectInputStream in)
-            throws java.io.IOException, ClassNotFoundException {
-        in.defaultReadObject();
-        dataFile = new RandomAccessFile(dataFileName, "rw");
+    public String getTablePath() {
+        return tablePath;
     }
 }

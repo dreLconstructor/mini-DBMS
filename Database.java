@@ -5,10 +5,93 @@ class Database implements Serializable {
     private static final long serialVersionUID = 1L;
     private String name;
     private Map<String, Table> tables;
+    private String dbPath;
+    public static final String TABLES_DIR = "tables";
+    private static final String METADATA_FILE = "metadata.dat";
 
-    public Database(String name) {
-        this.name = name;
+    public Database(String name) throws Exception {
+        this.name = name.toLowerCase();
         this.tables = new HashMap<>();
+        
+        // Create database directory
+        this.dbPath = name.toLowerCase();
+        File dbDir = new File(dbPath);
+        
+        if (!dbDir.exists()) {
+            if (!dbDir.mkdirs()) {
+                throw new Exception("Failed to create database directory: " + dbPath);
+            }
+            // Create tables subdirectory
+            File tablesDir = new File(dbPath + File.separator + TABLES_DIR);
+            if (!tablesDir.mkdirs()) {
+                throw new Exception("Failed to create tables directory");
+            }
+        }
+        
+        // Load existing metadata if any
+        loadMetadata();
+    }
+
+    private Database(String name, String dbPath) {
+        this.name = name.toLowerCase();
+        this.tables = new HashMap<>();
+        this.dbPath = dbPath;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void loadMetadata() throws Exception {
+        File metadataFile = new File(dbPath + File.separator + METADATA_FILE);
+        if (!metadataFile.exists()) {
+            return;
+        }
+        
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(metadataFile))) {
+            Map<String, TableMetadata> metadataMap = (Map<String, TableMetadata>) ois.readObject();
+            
+            for (Map.Entry<String, TableMetadata> entry : metadataMap.entrySet()) {
+                String tableName = entry.getKey();
+                TableMetadata metadata = entry.getValue();
+                Table table = Table.load(this, tableName, metadata);
+                if (table != null) {
+                    tables.put(tableName, table);
+                }
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            throw new Exception("Error loading metadata: " + e.getMessage());
+        }
+    }
+
+    private void saveMetadata() throws Exception {
+        File metadataFile = new File(dbPath + File.separator + METADATA_FILE);
+        Map<String, TableMetadata> metadataMap = new HashMap<>();
+        
+        for (Map.Entry<String, Table> entry : tables.entrySet()) {
+            metadataMap.put(entry.getKey(), entry.getValue().getMetadata());
+        }
+        
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(metadataFile))) {
+            oos.writeObject(metadataMap);
+        } catch (IOException e) {
+            throw new Exception("Error saving metadata: " + e.getMessage());
+        }
+    }
+
+    public static Database load(String dbName) {
+        String dbPath = dbName.toLowerCase();
+        File dbDir = new File(dbPath);
+        
+        if (!dbDir.exists() || !dbDir.isDirectory()) {
+            return null;
+        }
+        
+        Database db = new Database(dbName, dbPath);
+        try {
+            db.loadMetadata();
+            return db;
+        } catch (Exception e) {
+            System.err.println("Error loading database " + dbName + ": " + e.getMessage());
+            return null;
+        }
     }
 
     public void createTable(String tableName, List<String> attrTokens) throws Exception {
@@ -16,8 +99,9 @@ class Database implements Serializable {
             throw new Exception("Table " + tableName + " already exists");
         }
 
-        Table table = new Table(tableName, attrTokens);
+        Table table = new Table(this, tableName, attrTokens);
         tables.put(tableName.toLowerCase(), table);
+        saveMetadata();
         System.out.println("Table " + tableName + " created");
     }
 
@@ -32,113 +116,12 @@ class Database implements Serializable {
     public void insertInto(String tableName, List<String> values) throws Exception {
         Table table = getTable(tableName);
         table.insert(values);
+        saveMetadata();
     }
 
-    // [CHANGED] Now accepts List<String> tableNames to support multi-table cross-join.
-    // Single-table queries delegate to Table.select() as before.
-    public void select(List<String> tableNames, List<String> attributes, Condition whereCondition) throws Exception {
-        if (tableNames.size() == 1) {
-            // Single table — delegate to Table.select() unchanged
-            Table table = getTable(tableNames.get(0));
-            table.select(attributes, whereCondition);
-        } else {
-            // [CHANGED] Multi-table: perform a cross join across all named tables
-            List<Table> tableList = new ArrayList<>();
-            for (String tn : tableNames) {
-                tableList.add(getTable(tn));
-            }
-
-            // Gather all attribute metadata and all records from each table
-            // [CHANGED] Use getOrderedRecordPositions() so tables with a primary key
-            // are traversed in BST in-order, matching the rubric requirement.
-            List<List<Attribute>> allAttrLists = new ArrayList<>();
-            List<List<Record>> allRecordLists = new ArrayList<>();
-            for (Table t : tableList) {
-                allAttrLists.add(t.getAttributes());
-                List<Long> positions = t.getOrderedRecordPositions();
-                List<Record> records = new ArrayList<>();
-                for (Long pos : positions) {
-                    Record r = t.readRecordAtPosition(pos);
-                    if (r != null) records.add(r);
-                }
-                allRecordLists.add(records);
-            }
-
-            // Build combined attribute list (for WHERE evaluation and display)
-            List<Attribute> combinedAttrs = new ArrayList<>();
-            for (List<Attribute> attrList : allAttrLists) {
-                combinedAttrs.addAll(attrList);
-            }
-
-            // Compute Cartesian product of all record lists
-            List<Record> crossProduct = new ArrayList<>();
-            crossProduct.add(new Record()); // seed with one empty record
-            for (List<Record> rList : allRecordLists) {
-                List<Record> newProduct = new ArrayList<>();
-                for (Record existing : crossProduct) {
-                    for (Record r : rList) {
-                        // Merge existing combined record with next table's record
-                        Record merged = new Record();
-                        for (Map.Entry<String, Object> e : existing.getValues().entrySet()) {
-                            merged.setValue(e.getKey(), e.getValue());
-                        }
-                        for (Map.Entry<String, Object> e : r.getValues().entrySet()) {
-                            merged.setValue(e.getKey(), e.getValue());
-                        }
-                        newProduct.add(merged);
-                    }
-                }
-                crossProduct = newProduct;
-            }
-
-            // Filter by WHERE condition
-            List<Record> results = new ArrayList<>();
-            for (Record r : crossProduct) {
-                if (whereCondition == null || whereCondition.evaluate(r, combinedAttrs)) {
-                    results.add(r);
-                }
-            }
-
-            // Display results
-            if (results.isEmpty()) {
-                System.out.println("Nothing found");
-                return;
-            }
-
-            // Determine which attributes to display
-            List<String> displayAttrs;
-            if (attributes.size() == 1 && attributes.get(0).equals("*")) {
-                displayAttrs = new ArrayList<>();
-                for (Attribute attr : combinedAttrs) {
-                    displayAttrs.add(attr.getName());
-                }
-            } else {
-                displayAttrs = attributes;
-            }
-
-            // Print header
-            for (int i = 0; i < displayAttrs.size(); i++) {
-                if (i > 0) System.out.print(" | ");
-                System.out.print(displayAttrs.get(i).toUpperCase());
-            }
-            System.out.println();
-            System.out.println("-".repeat(50));
-
-            // Print rows
-            int rowNum = 1;
-            for (Record r : results) {
-                System.out.print(rowNum + ". ");
-                for (int i = 0; i < displayAttrs.size(); i++) {
-                    if (i > 0) System.out.print(" | ");
-                    Object val = r.getValue(displayAttrs.get(i));
-                    if (val == null) System.out.print("null");
-                    else if (val instanceof String) System.out.print("\"" + val + "\"");
-                    else System.out.print(val);
-                }
-                System.out.println();
-                rowNum++;
-            }
-        }
+    public void select(String tableName, List<String> attributes, Condition whereCondition) throws Exception {
+        Table table = getTable(tableName);
+        table.select(attributes, whereCondition);
     }
 
     public void deleteFrom(String tableName, Condition whereCondition) throws Exception {
@@ -146,15 +129,29 @@ class Database implements Serializable {
         int deletedCount = table.delete(whereCondition);
         System.out.println(deletedCount + " record(s) deleted");
 
-        // If no WHERE clause, remove the table entirely
+        // If no WHERE clause and all records deleted, remove the table
         if (whereCondition == null) {
-            // [CHANGED] Close file handles before deleting physical files
+            // Delete table files
             table.close();
+            File tableDir = new File(table.getTablePath());
+            deleteDirectory(tableDir);
             tables.remove(tableName.toLowerCase());
-            // [CHANGED] Delete the .dat and .idx files from disk
-            new File(tableName + ".dat").delete();
-            new File(tableName + ".idx").delete();
+            saveMetadata();
             System.out.println("Table " + tableName + " removed from database");
+        } else {
+            saveMetadata();
+        }
+    }
+
+    private void deleteDirectory(File dir) {
+        if (dir.exists() && dir.isDirectory()) {
+            File[] files = dir.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    file.delete();
+                }
+            }
+            dir.delete();
         }
     }
 
@@ -162,11 +159,13 @@ class Database implements Serializable {
         Table table = getTable(tableName);
         int updatedCount = table.update(setClauses, whereCondition);
         System.out.println(updatedCount + " record(s) updated");
+        saveMetadata();
     }
 
     public void renameTable(String tableName, List<String> newAttrNames) throws Exception {
         Table table = getTable(tableName);
         table.renameAttributes(newAttrNames);
+        saveMetadata();
         System.out.println("Table " + tableName + " attributes renamed");
     }
 
@@ -188,38 +187,29 @@ class Database implements Serializable {
             throw new Exception("Key attribute " + keyAttr + " not found in selected attributes");
         }
 
-        // [CHANGED] Build CREATE TABLE tokens with the key attribute FIRST.
-        // parseAttributes() enforces that PRIMARY KEY must be on the first attribute,
-        // so we must emit the key column before all others regardless of select-list order.
-        List<String> orderedNames = new ArrayList<>();
-        orderedNames.add(keyAttr);
-        for (String attrName : result.attributeNames) {
-            if (!attrName.equalsIgnoreCase(keyAttr)) orderedNames.add(attrName);
-        }
-
+        // Build CREATE TABLE tokens
         List<String> createTokens = new ArrayList<>();
-        for (int idx = 0; idx < orderedNames.size(); idx++) {
-            String attrName = orderedNames.get(idx);
+        for (String attrName : result.attributeNames) {
             createTokens.add(attrName);
             DataType type = result.attributeTypes.get(attrName);
             createTokens.add(type.toString());
-            if (idx == 0) { // key is always first
+
+            if (attrName.equalsIgnoreCase(keyAttr)) {
                 createTokens.add("PRIMARY");
                 createTokens.add("KEY");
             }
-            if (idx < orderedNames.size() - 1) createTokens.add(",");
+
+            createTokens.add(",");
         }
+        createTokens.remove(createTokens.size() - 1); // Remove last comma
 
         // Create the new table
-        Table newTable = new Table(newTableName, createTokens);
+        Table newTable = new Table(this, newTableName, createTokens);
 
-        // [CHANGED] suppress "1 record inserted" spam during internal LET population
-        newTable.setSilentInsert(true);
-
-        // Insert all records from SELECT result; skip duplicates gracefully
+        // Insert all records from SELECT result
         for (Record record : result.records) {
             List<String> valueTokens = new ArrayList<>();
-            for (String attrName : orderedNames) {
+            for (String attrName : result.attributeNames) {
                 Object value = record.getValue(attrName);
                 if (value instanceof String) {
                     valueTokens.add("\"" + value + "\"");
@@ -227,15 +217,11 @@ class Database implements Serializable {
                     valueTokens.add(value.toString());
                 }
             }
-            try {
-                newTable.insert(valueTokens);
-            } catch (Exception e) {
-                // [CHANGED] Duplicate primary key during LET — skip silently like INSERT does
-                System.out.println("Warning: skipping record in " + newTableName + " — " + e.getMessage());
-            }
+            newTable.insert(valueTokens);
         }
 
         tables.put(newTableName.toLowerCase(), newTable);
+        saveMetadata();
         System.out.println("Table " + newTableName + " created from SELECT with key " + keyAttr);
     }
 
@@ -256,32 +242,53 @@ class Database implements Serializable {
         table.describe();
     }
 
-    // [CHANGED] Deserialize a Database from <dbName>.db; returns null if file doesn't exist
-    public static Database load(String dbName) {
-        File file = new File(dbName + ".db");
-        if (!file.exists()) {
-            return null;
-        }
-        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
-            return (Database) ois.readObject();
-        } catch (Exception e) {
-            System.err.println("Failed to load database '" + dbName + "': " + e.getMessage());
-            return null;
-        }
-    }
-
-    // [CHANGED] Serialize the entire Database to <name>.db so it persists across sessions
     public void close() throws Exception {
+        saveMetadata();
         for (Table table : tables.values()) {
             table.close();
-        }
-        // Persist the database object to disk
-        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(name + ".db"))) {
-            oos.writeObject(this);
         }
     }
 
     public String getName() {
         return name;
     }
+
+    public String getPath() {
+        return dbPath;
+    }
+}
+
+// Serializable metadata class for table persistence
+class TableMetadata implements Serializable {
+    private static final long serialVersionUID = 1L;
+    
+    private String name;
+    private List<String> attributeNames;
+    private List<DataType> attributeTypes;
+    private List<Boolean> isPrimaryKey;
+    private String primaryKey;
+    private int recordCount;
+    
+    public TableMetadata(String name, List<Attribute> attributes, String primaryKey, int recordCount) {
+        this.name = name;
+        this.attributeNames = new ArrayList<>();
+        this.attributeTypes = new ArrayList<>();
+        this.isPrimaryKey = new ArrayList<>();
+        
+        for (Attribute attr : attributes) {
+            this.attributeNames.add(attr.getName());
+            this.attributeTypes.add(attr.getType());
+            this.isPrimaryKey.add(attr.isPrimaryKey());
+        }
+        
+        this.primaryKey = primaryKey;
+        this.recordCount = recordCount;
+    }
+    
+    public String getName() { return name; }
+    public List<String> getAttributeNames() { return attributeNames; }
+    public List<DataType> getAttributeTypes() { return attributeTypes; }
+    public List<Boolean> getIsPrimaryKey() { return isPrimaryKey; }
+    public String getPrimaryKey() { return primaryKey; }
+    public int getRecordCount() { return recordCount; }
 }

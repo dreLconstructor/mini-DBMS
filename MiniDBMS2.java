@@ -5,9 +5,6 @@ public class MiniDBMS2 {
     private static Scanner scanner = new Scanner(System.in);
     private static String currentDatabase = null;
     private static Map<String, Database> databases = new HashMap<>();
-    // [CHANGED] Leftover characters after the last ";" on a line are kept here
-    // so the next call to readMultilineInput() picks them up before reading more input.
-    private static StringBuilder inputBuffer = new StringBuilder();
 
     public static void main(String[] args) {
         System.out.println("=====================================");
@@ -58,37 +55,37 @@ public class MiniDBMS2 {
     }
 
     private static String readMultilineInput() {
-        // [CHANGED] Rewritten to handle multiple semicolon-separated commands on one line.
-        // inputBuffer accumulates characters read from lines; we return one command at a time
-        // (everything up to and including the next ";"), leaving the rest in the buffer.
+        StringBuilder sb = new StringBuilder();
+        String line;
+        boolean inMultiLine = false;
+
         while (true) {
-            // Check if the buffer already contains a complete command (has a ";")
-            int semiIdx = inputBuffer.indexOf(";");
-            if (semiIdx >= 0) {
-                String command = inputBuffer.substring(0, semiIdx + 1).trim();
-                inputBuffer.delete(0, semiIdx + 1);
-                if (!command.isEmpty()) {
-                    return command;
+            if (!inMultiLine) {
+                if (!scanner.hasNextLine()) {
+                    return null;
                 }
-                // Empty segment (e.g. double ";;"), keep scanning
-                continue;
+                line = scanner.nextLine();
+            } else {
+                System.out.print("... ");
+                if (!scanner.hasNextLine()) {
+                    return null;
+                }
+                line = scanner.nextLine();
             }
 
-            // Need more input
-            if (!scanner.hasNextLine()) {
-                // EOF — return whatever is left if non-empty, else null
-                String remaining = inputBuffer.toString().trim();
-                inputBuffer.setLength(0);
-                return remaining.isEmpty() ? null : remaining;
+            if (sb.length() == 0) {
+                sb.append(line);
+            } else {
+                sb.append(" ").append(line);
             }
 
-            String line = scanner.nextLine();
-            // Append with a space separator so tokens across lines merge correctly
-            if (inputBuffer.length() > 0) {
-                inputBuffer.append(" ");
+            if (line.trim().endsWith(";")) {
+                break;
             }
-            inputBuffer.append(line);
+            inMultiLine = true;
         }
+
+        return sb.toString();
     }
 
     private static void processCommand(String input) throws Exception {
@@ -144,17 +141,6 @@ public class MiniDBMS2 {
         }
     }
 
-    // [CHANGED] SQL keywords ordered longest-first so longer matches take priority
-    // (e.g. "DELETE" is checked before "LET", "INSERT" before "SET").
-    private static final String[] SQL_KEYWORDS = {
-        "DATABASE", "DESCRIBE", "AVERAGE", "INTEGER", "PRIMARY",
-        "SELECT", "INSERT", "UPDATE", "DELETE", "RENAME", "CREATE", "VALUES",
-        "FLOAT", "WHERE", "TABLE", "COUNT",
-        "FROM", "TEXT", "INTO",
-        "KEY", "SET", "USE", "LET", "AVG", "MIN", "MAX", "AND",
-        "OR"
-    };
-
     private static List<String> tokenize(String input) {
         List<String> tokens = new ArrayList<>();
         StringBuilder current = new StringBuilder();
@@ -192,51 +178,7 @@ public class MiniDBMS2 {
             tokens.add(current.toString());
         }
 
-        // [CHANGED] Split any tokens that have keywords fused to identifiers due to missing spaces
-        // e.g. "deletestudent" -> ["delete","student"], "atext" -> ["a","text"], "orb" -> ["or","b"]
-        List<String> result = new ArrayList<>();
-        for (String token : tokens) {
-            splitFusedToken(token, result);
-        }
-        return result;
-    }
-
-    // [CHANGED] Recursively splits a token that begins or ends with a SQL keyword.
-    // Checks starts-with first (handles "deletestudent", "orb"), then ends-with
-    // (handles "atext", "zfrom", "studentwhere"). Recurses so multi-fused tokens
-    // like "deletestudent" also get their remainder checked.
-    private static void splitFusedToken(String token, List<String> out) {
-        // Never split: quoted strings, punctuation/operators, or single-char tokens
-        if (token.startsWith("\"") || token.length() <= 1 ||
-                token.equals("(") || token.equals(")") || token.equals(",") ||
-                token.equals("=") || token.equals("!=") || token.equals("<=") ||
-                token.equals(">=") || token.equals("<") || token.equals(">")) {
-            out.add(token);
-            return;
-        }
-
-        String upper = token.toUpperCase();
-
-        // Check if token STARTS WITH a keyword followed by more characters
-        for (String kw : SQL_KEYWORDS) {
-            if (upper.startsWith(kw) && upper.length() > kw.length()) {
-                splitFusedToken(token.substring(0, kw.length()), out);
-                splitFusedToken(token.substring(kw.length()), out);
-                return;
-            }
-        }
-
-        // Check if token ENDS WITH a keyword preceded by more characters
-        for (String kw : SQL_KEYWORDS) {
-            if (upper.endsWith(kw) && upper.length() > kw.length()) {
-                splitFusedToken(token.substring(0, token.length() - kw.length()), out);
-                splitFusedToken(token.substring(token.length() - kw.length()), out);
-                return;
-            }
-        }
-
-        // No keyword found — emit as-is
-        out.add(token);
+        return tokens;
     }
 
     private static void parseCreate(List<String> tokens) throws Exception {
@@ -294,26 +236,14 @@ public class MiniDBMS2 {
             throw new Exception("No database selected");
         }
 
-        // [CHANGED] "INTO" is now optional — rubric specifies INSERT TableName VALUES (...)
-        // but we also still accept INSERT INTO TableName VALUES (...) for compatibility.
-        String tableName;
-        int tableIdx;
-        if (tokens.size() > 1 && tokens.get(1).toUpperCase().equals("INTO")) {
-            if (tokens.size() < 3) {
-                throw new Exception("Invalid INSERT syntax. Missing table name after INTO.");
-            }
-            tableName = tokens.get(2);
-            tableIdx = 2;
-        } else {
-            if (tokens.size() < 2) {
-                throw new Exception("Invalid INSERT syntax. Use: INSERT TableName VALUES (...);");
-            }
-            tableName = tokens.get(1);
-            tableIdx = 1;
+        if (tokens.size() < 3 || !tokens.get(1).toUpperCase().equals("INTO")) {
+            throw new Exception("Invalid INSERT syntax. Use: INSERT INTO tablename VALUES (...);");
         }
 
+        String tableName = tokens.get(2);
+
         int valuesIndex = -1;
-        for (int i = tableIdx + 1; i < tokens.size(); i++) {
+        for (int i = 3; i < tokens.size(); i++) {
             if (tokens.get(i).toUpperCase().equals("VALUES")) {
                 valuesIndex = i;
                 break;
@@ -355,10 +285,8 @@ public class MiniDBMS2 {
         // Check for aggregate functions
         if (tokens.size() > 1) {
             String firstToken = tokens.get(1).toUpperCase();
-            // [CHANGED] Added "AVERAGE" as an alias alongside "AVG"
             if (firstToken.equals("COUNT") || firstToken.equals("MIN") ||
-                    firstToken.equals("MAX") || firstToken.equals("AVG") ||
-                    firstToken.equals("AVERAGE")) {
+                    firstToken.equals("MAX") || firstToken.equals("AVG")) {
                 parseAggregateSelect(tokens);
                 return;
             }
@@ -389,29 +317,26 @@ public class MiniDBMS2 {
         if (i >= tokens.size()) {
             throw new Exception("Invalid SELECT syntax. Missing table name.");
         }
-
-        // [CHANGED] Collect multiple comma-separated table names for cross-join support
-        List<String> tableNames = new ArrayList<>();
-        tableNames.add(tokens.get(i));
+        String tableName = tokens.get(i);
         i++;
-        while (i < tokens.size() && tokens.get(i).equals(",")) {
-            i++; // skip comma
-            if (i >= tokens.size()) {
-                throw new Exception("Expected table name after ',' in FROM clause.");
-            }
-            tableNames.add(tokens.get(i));
-            i++;
-        }
 
-        // [CHANGED] Parse up to 3 conditions joined by AND/OR
         Condition whereCondition = null;
         if (i < tokens.size() && tokens.get(i).toUpperCase().equals("WHERE")) {
             i++;
-            whereCondition = parseWhereConditions(tokens, i);
+            if (i + 2 >= tokens.size()) {
+                throw new Exception("Invalid WHERE clause");
+            }
+
+            String leftAttr = tokens.get(i);
+            String operator = tokens.get(i + 1);
+            String right = tokens.get(i + 2);
+
+            boolean isConstant = determineIfConstant(right);
+            whereCondition = new Condition(leftAttr, operator, right, isConstant);
         }
 
         Database db = databases.get(currentDatabase);
-        db.select(tableNames, attrList, whereCondition);
+        db.select(tableName, attrList, whereCondition);
     }
 
     private static void parseAggregateSelect(List<String> tokens) throws Exception {
@@ -419,27 +344,26 @@ public class MiniDBMS2 {
         String attribute;
         int i = 2;
 
-        // [CHANGED] The tokenizer always splits "(" into its own token, so
-        // "avg(gpa)" becomes ["avg", "(", "gpa", ")"] — tokens.get(2) is always "(", never "(gpa)".
-        // We now skip the "(" token, read the attribute at tokens.get(3), then skip ")".
-        if (i < tokens.size() && tokens.get(i).equals("(")) {
-            i++; // skip "("
-            if (i >= tokens.size()) throw new Exception("Invalid aggregate syntax: missing attribute");
-            attribute = tokens.get(i); // "gpa" or "*"
-            i++; // skip attribute
-            if (i < tokens.size() && tokens.get(i).equals(")")) {
-                i++; // skip ")"
-            }
-        } else if (i < tokens.size() && tokens.get(i).startsWith("(")) {
-            // Fallback for compact token like "(gpa)" (shouldn't occur with this tokenizer, but kept for safety)
-            attribute = tokens.get(i).substring(1);
-            if (attribute.endsWith(")")) attribute = attribute.substring(0, attribute.length() - 1);
-            i++;
+        // Handle count(*) specially
+        if (function.equals("COUNT") && tokens.get(2).equals("(*)")) {
+            attribute = "*";
+            i = 3;
         } else {
-            // No parentheses at all
-            attribute = tokens.get(i);
-            i++;
-            if (i < tokens.size() && tokens.get(i).equals(")")) i++;
+            // Parse attribute name (might be in parentheses)
+            if (tokens.get(2).startsWith("(")) {
+                attribute = tokens.get(2).substring(1);
+                if (attribute.endsWith(")")) {
+                    attribute = attribute.substring(0, attribute.length() - 1);
+                }
+                i = 3;
+            } else {
+                attribute = tokens.get(2);
+                i = 3;
+                // Skip closing parenthesis if present
+                if (i < tokens.size() && tokens.get(i).equals(")")) {
+                    i++;
+                }
+            }
         }
 
         // Find FROM clause
@@ -460,11 +384,20 @@ public class MiniDBMS2 {
         String tableName = tokens.get(i);
         i++;
 
-        // [CHANGED] Parse WHERE clause with AND/OR compound support
+        // Parse WHERE clause if present
         Condition whereCondition = null;
         if (i < tokens.size() && tokens.get(i).toUpperCase().equals("WHERE")) {
             i++;
-            whereCondition = parseWhereConditions(tokens, i);
+            if (i + 2 >= tokens.size()) {
+                throw new Exception("Invalid WHERE clause");
+            }
+
+            String leftAttr = tokens.get(i);
+            String operator = tokens.get(i + 1);
+            String right = tokens.get(i + 2);
+
+            boolean isConstant = determineIfConstant(right);
+            whereCondition = new Condition(leftAttr, operator, right, isConstant);
         }
 
         Database db = databases.get(currentDatabase);
@@ -506,11 +439,20 @@ public class MiniDBMS2 {
             }
         }
 
-        // [CHANGED] Parse WHERE clause with AND/OR compound support
+        // Parse WHERE clause if present
         Condition whereCondition = null;
         if (i < tokens.size() && tokens.get(i).toUpperCase().equals("WHERE")) {
             i++;
-            whereCondition = parseWhereConditions(tokens, i);
+            if (i + 2 >= tokens.size()) {
+                throw new Exception("Invalid WHERE clause");
+            }
+
+            String leftAttr = tokens.get(i);
+            String operator = tokens.get(i + 1);
+            String right = tokens.get(i + 2);
+
+            boolean isConstant = determineIfConstant(right);
+            whereCondition = new Condition(leftAttr, operator, right, isConstant);
         }
 
         Database db = databases.get(currentDatabase);
@@ -529,11 +471,21 @@ public class MiniDBMS2 {
         String tableName = tokens.get(1);
         int i = 2;
 
-        // [CHANGED] Parse WHERE clause with AND/OR compound support
         Condition whereCondition = null;
+
+        // Check for WHERE clause
         if (i < tokens.size() && tokens.get(i).toUpperCase().equals("WHERE")) {
             i++;
-            whereCondition = parseWhereConditions(tokens, i);
+            if (i + 2 >= tokens.size()) {
+                throw new Exception("Invalid WHERE clause");
+            }
+
+            String leftAttr = tokens.get(i);
+            String operator = tokens.get(i + 1);
+            String right = tokens.get(i + 2);
+
+            boolean isConstant = determineIfConstant(right);
+            whereCondition = new Condition(leftAttr, operator, right, isConstant);
         }
 
         Database db = databases.get(currentDatabase);
@@ -627,86 +579,69 @@ public class MiniDBMS2 {
             throw new Exception("Missing table name in LET command");
         }
 
-        // [CHANGED] Collect multiple comma-separated table names (mirrors parseSelect)
-        List<String> tableNames = new ArrayList<>();
-        tableNames.add(tokens.get(i));
+        String tableName = tokens.get(i);
         i++;
-        while (i < tokens.size() && tokens.get(i).equals(",")) {
-            i++; // skip comma
-            if (i >= tokens.size()) throw new Exception("Expected table name after ',' in FROM clause.");
-            tableNames.add(tokens.get(i));
-            i++;
-        }
 
-        // [CHANGED] Parse WHERE clause with AND/OR compound support
+        // Parse WHERE clause if present
         Condition whereCondition = null;
         if (i < tokens.size() && tokens.get(i).toUpperCase().equals("WHERE")) {
             i++;
-            whereCondition = parseWhereConditions(tokens, i);
-        }
-
-        // Build combined attribute list from all tables
-        List<Table> tableList = new ArrayList<>();
-        List<Attribute> combinedAttrs = new ArrayList<>();
-        for (String tn : tableNames) {
-            Table t = db.getTable(tn);
-            tableList.add(t);
-            combinedAttrs.addAll(t.getAttributes());
-        }
-
-        // Compute Cartesian product of all tables' records
-        // [CHANGED] Use getOrderedRecordPositions() so PK tables use BST in-order traversal
-        List<Record> crossProduct = new ArrayList<>();
-        crossProduct.add(new Record());
-        for (Table t : tableList) {
-            List<Long> positions = t.getOrderedRecordPositions();
-            List<Record> tableRecords = new ArrayList<>();
-            for (Long pos : positions) {
-                Record r = t.readRecordAtPosition(pos);
-                if (r != null) tableRecords.add(r);
+            if (i + 2 >= tokens.size()) {
+                throw new Exception("Invalid WHERE clause in LET command");
             }
-            List<Record> newProduct = new ArrayList<>();
-            for (Record existing : crossProduct) {
-                for (Record r : tableRecords) {
-                    Record merged = new Record();
-                    for (Map.Entry<String, Object> e : existing.getValues().entrySet())
-                        merged.setValue(e.getKey(), e.getValue());
-                    for (Map.Entry<String, Object> e : r.getValues().entrySet())
-                        merged.setValue(e.getKey(), e.getValue());
-                    newProduct.add(merged);
-                }
-            }
-            crossProduct = newProduct;
+
+            String leftAttr = tokens.get(i);
+            String operator = tokens.get(i + 1);
+            String right = tokens.get(i + 2);
+
+            boolean isConstant = determineIfConstant(right);
+            whereCondition = new Condition(leftAttr, operator, right, isConstant);
         }
 
-        // Filter by WHERE, then build result
+        // Execute the SELECT
+        Table table = db.getTable(tableName);
         List<Record> results = new ArrayList<>();
-        for (Record record : crossProduct) {
-            if (whereCondition == null || whereCondition.evaluate(record, combinedAttrs)) {
-                results.add(record);
-            }
-        }
-
-        // Resolve attribute types and display attribute list
         Map<String, DataType> attributeTypes = new HashMap<>();
-        for (Attribute attr : combinedAttrs) {
-            attributeTypes.put(attr.getName(), attr.getType());
-        }
 
+        // Determine which attributes to select
         List<String> displayAttrs;
         if (attrList.size() == 1 && attrList.get(0).equals("*")) {
             displayAttrs = new ArrayList<>();
-            for (Attribute attr : combinedAttrs) {
+            for (Attribute attr : table.getAttributes()) {
                 displayAttrs.add(attr.getName());
+                attributeTypes.put(attr.getName(), attr.getType());
             }
         } else {
             displayAttrs = attrList;
             for (String attrName : attrList) {
-                boolean found = false;
-                for (Attribute attr : combinedAttrs) {
-                    if (attr.getName().equalsIgnoreCase(attrName)) { found = true; break; }
+                Attribute attr = table.getAttribute(attrName);
+                if (attr == null) {
+                    throw new Exception("Unknown attribute: " + attrName);
                 }
-                if (!found) throw new Exception("Unknown attribute: " + attrName);
+                attributeTypes.put(attrName, attr.getType());
+            }
+        }
+
+        // Get records
+        List<Long> recordPositions;
+        if (whereCondition != null && whereCondition.isKeyCondition(table.getPrimaryKey())) {
+            Object keyValue = whereCondition.getConstantValue();
+            Attribute keyAttr = table.getAttribute(table.getPrimaryKey());
+            Object parsedKey = keyAttr.parseValue(keyValue.toString());
+            Long position = table.getIndex().search((Comparable) parsedKey);
+            recordPositions = position != null ? Collections.singletonList(position) : new ArrayList<>();
+        } else if (table.getPrimaryKey() != null && table.getIndex() != null) {
+            recordPositions = table.getIndex().inOrderTraversal();
+        } else {
+            recordPositions = table.getAllRecordPositions();
+        }
+
+        for (Long pos : recordPositions) {
+            Record record = table.readRecordAtPosition(pos);
+            if (record != null) {
+                if (whereCondition == null || whereCondition.evaluate(record, table.getAttributes())) {
+                    results.add(record);
+                }
             }
         }
 
@@ -749,32 +684,32 @@ public class MiniDBMS2 {
             }
 
             try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                StringBuilder command = new StringBuilder();
+                String line;
+
                 System.out.println("Processing input file: " + inputFile);
                 System.out.println("=====================================");
 
-                // [CHANGED] Use a buffer that accumulates all file content so we can split
-                // correctly on ";" boundaries regardless of how many commands share a line.
-                StringBuilder buffer = new StringBuilder();
-                String line;
                 while ((line = reader.readLine()) != null) {
-                    if (line.trim().isEmpty() || line.trim().startsWith("--")) continue;
-                    if (buffer.length() > 0) buffer.append(" ");
-                    buffer.append(line);
-                }
+                    // Skip empty lines and comments
+                    if (line.trim().isEmpty() || line.trim().startsWith("--")) {
+                        continue;
+                    }
 
-                // Split on ";" and execute each command in order
-                while (buffer.length() > 0) {
-                    int semi = buffer.indexOf(";");
-                    if (semi < 0) break; // no more complete commands
-                    String cmd = buffer.substring(0, semi + 1).trim();
-                    buffer.delete(0, semi + 1);
-                    if (cmd.isEmpty() || cmd.equals(";")) continue;
+                    command.append(line).append(" ");
 
-                    System.out.println("\n> " + cmd);
-                    try {
-                        processCommand(cmd);
-                    } catch (Exception e) {
-                        System.out.println("Error: " + e.getMessage());
+                    if (line.trim().endsWith(";")) {
+                        // Execute the command
+                        String cmd = command.toString().trim();
+                        System.out.println("\n> " + cmd);
+
+                        try {
+                            processCommand(cmd);
+                        } catch (Exception e) {
+                            System.out.println("Error: " + e.getMessage());
+                        }
+
+                        command = new StringBuilder();
                     }
                 }
 
@@ -787,42 +722,6 @@ public class MiniDBMS2 {
                 fileOut.close();
             }
         }
-    }
-
-    // [CHANGED] Helper: parses WHERE conditions starting at tokens[startIdx].
-    // Supports up to 3 conditions joined by AND/OR and returns a (possibly compound) Condition.
-    private static Condition parseWhereConditions(List<String> tokens, int startIdx) throws Exception {
-        if (startIdx + 2 >= tokens.size()) {
-            throw new Exception("Invalid WHERE clause");
-        }
-        List<Condition> conditions = new ArrayList<>();
-        List<String> logicalOps = new ArrayList<>();
-
-        // First condition
-        conditions.add(new Condition(
-                tokens.get(startIdx),
-                tokens.get(startIdx + 1),
-                tokens.get(startIdx + 2),
-                determineIfConstant(tokens.get(startIdx + 2))));
-        int i = startIdx + 3;
-
-        // Additional conditions joined by AND / OR
-        while (i < tokens.size() &&
-                (tokens.get(i).toUpperCase().equals("AND") || tokens.get(i).toUpperCase().equals("OR"))) {
-            logicalOps.add(tokens.get(i).toUpperCase());
-            i++;
-            if (i + 2 >= tokens.size()) {
-                throw new Exception("Invalid WHERE clause after " + logicalOps.get(logicalOps.size() - 1));
-            }
-            conditions.add(new Condition(
-                    tokens.get(i),
-                    tokens.get(i + 1),
-                    tokens.get(i + 2),
-                    determineIfConstant(tokens.get(i + 2))));
-            i += 3;
-        }
-
-        return conditions.size() == 1 ? conditions.get(0) : new Condition(conditions, logicalOps);
     }
 
     private static boolean determineIfConstant(String token) {
